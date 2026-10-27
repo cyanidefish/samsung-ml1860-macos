@@ -1,0 +1,9 @@
+# Build output (made by ./build.sh)
+/build/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

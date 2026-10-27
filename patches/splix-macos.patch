@@ -1,0 +1,293 @@
+diff --git a/src/cache.cpp b/src/cache.cpp
+index d31b57f..7c7eb93 100644
+--- a/src/cache.cpp
++++ b/src/cache.cpp
+@@ -57,6 +57,10 @@ static Semaphore _pageTableLock;
+ static CacheEntry *_inMemory = NULL, *_inMemoryLast = NULL;
+ static unsigned long _pagesInMemory = 0;
+ 
++// Set (under _pageTableLock) when a swapped page can't be read back. The job
++// is then stopped instead of waiting forever for a page that is lost.
++static bool _cacheFailed = false;
++
+ 
+ 
+ /*
+@@ -110,8 +114,11 @@ static void __registerIntoCacheList(CacheEntry *entry, bool swapLast)
+             break;
+     }
+ 
+-    // Register the new entry
+-    if (swapLast && tmp == _inMemoryLast) {
++    // Register the new entry. Never swap out the page the main thread is
++    // waiting for (it may have just been restored to the end of the list);
++    // swap the new entry instead.
++    if (swapLast && (tmp == _inMemoryLast || (_inMemoryLast &&
++        _pageRequested && _inMemoryLast->page()->pageNr() == _pageRequested))) {
+         entry->swapToDisk();
+         swapLast = false;
+     } else {
+@@ -142,18 +149,23 @@ static void __registerIntoCacheList(CacheEntry *entry, bool swapLast)
+     }
+ }
+ 
+-static void __manageMemoryCache(CacheEntry *entry)
++// Caller must hold _pageTableLock.
++static void __manageMemoryCacheLocked(CacheEntry *entry)
+ {
+-    _pageTableLock.lock();
+-
+     // Append an entry
+     if (entry) {
+         __registerIntoCacheList(entry, _pagesInMemory >= CACHESIZE);
+ 
+     // Preload the best page
+     } else {
+-        unsigned int nr;
+-
++        unsigned long nr;
++
++        // The main thread is waiting for a swapped page: restore that one
++        // first, otherwise it waits forever.
++        if (_pageRequested && _pageRequested <= _maxPagesInTable &&
++            _pages[_pageRequested-1] && _pages[_pageRequested-1]->isSwapped())
++            nr = _pageRequested;
++        else {
+         if (_inMemoryLast)
+             nr = _inMemoryLast->page()->pageNr();
+         else
+@@ -178,9 +190,20 @@ static void __manageMemoryCache(CacheEntry *entry)
+                     nr -= 2;
+                 break;
+         }
+-        if (nr <= _maxPagesInTable && _pages[nr-1]) {
+-            if (_pages[nr-1]->isSwapped())
+-                _pages[nr-1]->restoreIntoMemory();
++        }
++        // Only swapped pages can be preloaded; a page already in memory is
++        // already linked in the list and relinking it would corrupt the list.
++        if (nr && nr <= _maxPagesInTable && _pages[nr-1] &&
++            _pages[nr-1]->isSwapped()) {
++            if (!_pages[nr-1]->restoreIntoMemory()) {
++                // The swap file can't be read, so this page is lost. Stop the
++                // job rather than retrying forever, and wake the main thread.
++                ERRORMSG(_("Page %lu could not be read back from disk. Job "
++                    "aborted."), nr);
++                _cacheFailed = true;
++                _pageAvailable++;
++                return;
++            }
+             _pages[nr-1]->setNext(NULL);
+             _pages[nr-1]->setPrevious(_inMemoryLast);
+             if (_inMemoryLast) {
+@@ -195,7 +218,26 @@ static void __manageMemoryCache(CacheEntry *entry)
+                 _pageAvailable++;
+         }
+     }
++}
++
++static void __manageMemoryCache(CacheEntry *entry)
++{
++    _pageTableLock.lock();
++    __manageMemoryCacheLocked(entry);
++    _pageTableLock.unlock();
++}
++
++// True when the main thread is waiting for a page that is swapped to disk.
++// Takes the lock so it sees _pageRequested once getNextPage() has set it.
++static bool __requestedPageIsSwapped()
++{
++    bool res;
++
++    _pageTableLock.lock();
++    res = !_cacheFailed && _pageRequested && _pageRequested <= _maxPagesInTable &&
++        _pages[_pageRequested-1] && _pages[_pageRequested-1]->isSwapped();
+     _pageTableLock.unlock();
++    return res;
+ }
+ 
+ static void* _cacheControllerThread(void *_exitVar)
+@@ -227,22 +269,28 @@ static void* _cacheControllerThread(void *_exitVar)
+         // Does the thread needs to exit?
+         if (*needToExit)
+             break;
++        // A page was lost; the job is being stopped, so do nothing more
++        if (_cacheFailed)
++            continue;
+ 
+ 
+         /*
+          * Check what action to do
+          */
+-        // Nothing?
+-        if (!_waitingList && (_pagesInMemory == CACHESIZE || 
++        // The main thread waits for a swapped page: restoring it comes first
++        if (__requestedPageIsSwapped())
++            preloadPage = true;
++        // Nothing? (">=": restoring a requested page can go one over)
++        else if (!_waitingList && (_pagesInMemory >= CACHESIZE ||
+             _pagesInMemory == _pagesInTable))
+             continue;
+         // new page to append and pages to preload?
+-        // Choose one action of them to do (and inverse the action to do at 
++        // Choose one action of them to do (and inverse the action to do at
+         // each loop)
+-        if (_waitingList && !(_pagesInMemory == CACHESIZE || 
++        else if (_waitingList && !(_pagesInMemory >= CACHESIZE ||
+             _pagesInMemory == _pagesInTable)) {
+             preloadPage = whatToDo;
+-            whatToDo = ~whatToDo;
++            whatToDo = !whatToDo;
+         // One of the two thing to do
+         } else
+             preloadPage = (_waitingList == NULL);
+@@ -292,24 +340,24 @@ static void* _cacheControllerThread(void *_exitVar)
+                     }
+                 }
+ 
+-                // Store the page in the table
++                // Store the page in the table. Keep the lock held until the
++                // entry is fully placed: once it is in _pages, the main thread
++                // may take and delete it, so it must not see it half-linked.
+                 _pages[entry->page()->pageNr() - 1] = entry;
++                _pagesInTable++;
++
++                // Does the main thread needs this page?
++                if (_pageRequested == entry->page()->pageNr()) {
++                    entry->setNext(NULL);
++                    entry->setPrevious(NULL);
++                    _pageAvailable++;
++
++                // So check whether the page can be kept in memory or have to
++                // be swapped on the disk
++                } else
++                    __manageMemoryCacheLocked(entry);
+                 _pageTableLock.unlock();
+             }
+-            _pagesInTable++;
+-
+-            // Does the main thread needs this page?
+-            if (_pageRequested == entry->page()->pageNr()) {
+-                _pageTableLock.lock();
+-                entry->setNext(NULL);
+-                entry->setPrevious(NULL);
+-                _pageAvailable++;
+-                _pageTableLock.unlock();
+-
+-            // So check whether the page can be kept in memory or have to
+-            // be swapped on the disk
+-            } else 
+-                __manageMemoryCache(entry);
+         }
+     }
+ 
+@@ -350,7 +398,11 @@ bool uninitializeCache()
+             "controller thread"));
+         res = false;
+     }
+- 
++
++    // A page was lost while swapped to disk: the job is incomplete
++    if (_cacheFailed)
++        res = false;
++
+     // Check if all pages has been read. Otherwise free them
+     for (unsigned long i=0; i < _maxPagesInTable; i++) {
+         if (_pages[i]) {
+@@ -430,7 +482,12 @@ Page* getNextPage()
+     while (nr && (!_numberOfPages || _numberOfPages >= nr)) {
+         {
+             _pageTableLock.lock();
+-            if (_maxPagesInTable >= nr && _pages[nr - 1] && 
++            // The cache thread lost a page: stop the job
++            if (_cacheFailed) {
++                _pageTableLock.unlock();
++                break;
++            }
++            if (_maxPagesInTable >= nr && _pages[nr - 1] &&
+                 !_pages[nr - 1]->isSwapped()) {
+                 entry = _pages[nr - 1];
+                 _pages[nr - 1] = NULL;
+@@ -443,7 +500,12 @@ Page* getNextPage()
+                 if (entry == _inMemory)
+                     _inMemory = entry->next();
+                 if (entry == _inMemoryLast)
+-                    _inMemoryLast = NULL;
++                    _inMemoryLast = entry->previous();
++                // Update the counters under the lock; the cache thread
++                // changes them too.
++                _pagesInTable--;
++                if (!notUnregister)
++                    _pagesInMemory--;
+                 _pageTableLock.unlock();
+                 break;
+             } else if (_maxPagesInTable >= nr && _pages[nr - 1] && 
+@@ -458,14 +520,11 @@ Page* getNextPage()
+     // Extract the page instance
+     if (!entry)
+         return NULL;
+-    _pagesInTable--;
+     _lastPageRequested = nr;
+     page = entry->page();
+     delete entry;
+ 
+     // Preload a new page
+-    if (!notUnregister)
+-        _pagesInMemory--;
+     _work++;
+ 
+     return page;
+@@ -528,7 +587,8 @@ CacheEntry::~CacheEntry()
+ 
+ bool CacheEntry::swapToDisk()
+ {
+-    const char *path = "/tmp/splixV2-pageXXXXXX";
++    const char *name = "/splixV2-pageXXXXXX";
++    const char *dir = getenv("TMPDIR");
+     int fd;
+ 
+     if (_tempFile) {
+@@ -537,9 +597,12 @@ bool CacheEntry::swapToDisk()
+         return false;
+     }
+ 
+-    // Create the temporarily file
+-    _tempFile = new char[strlen(path)+1];
+-    strcpy(_tempFile, path);
++    // Create the temporary file in $TMPDIR (set by cupsd), else /tmp
++    if (!dir || !*dir || strlen(dir) > 1024)
++        dir = "/tmp";
++    _tempFile = new char[strlen(dir)+strlen(name)+1];
++    strcpy(_tempFile, dir);
++    strcat(_tempFile, name);
+     if ((fd = mkstemp(_tempFile)) == -1) {
+         delete[] _tempFile;
+         _tempFile = NULL;
+@@ -583,6 +646,7 @@ bool CacheEntry::restoreIntoMemory()
+     // Restore the instance
+     if (!(_page = Page::restoreIntoMemory(fd))) {
+         ERRORMSG(_("Cannot restore page into memory"));
++        close(fd);
+         return false;
+     }
+ 
+diff --git a/src/document.cpp b/src/document.cpp
+index d5e3b77..bd3bbf3 100644
+--- a/src/document.cpp
++++ b/src/document.cpp
+@@ -108,7 +108,14 @@ Page* Document::getNextRawPage(const Request& request)
+     page->setHeight(pageHeight);
+     page->setColorsNr(colors);
+     page->setPageNr(_currentPage);
+-    page->setCompression(header.cupsCompression);
++    // Some rasterizers drop cupsCompression from the PPD; monochrome QPDL v5
++    // printers (ML-1860 series) only use JBIG (0x15), so fall back to it.
++    if (!header.cupsCompression && colors == 1 &&
++        request.printer()->qpdlVersion() == 5) {
++        WARNMSG(_("Raster header has no compression, using JBIG (0x15)"));
++        page->setCompression(0x15);
++    } else
++        page->setCompression(header.cupsCompression);
+     page->setCopiesNr(header.NumCopies);
+ 
+     // Calculate clippings and margins
